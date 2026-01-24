@@ -1,26 +1,40 @@
-Platform: Jetson AGX Xavier | ROS 2 Foxy (Ubuntu 20.04)
+# Optimized ROS 2 Gripper Integration for TurtleBot3 via OpenCR Firmware
 
-Project Summary This project focuses on integrating a 1-axis Dynamixel gripper into the TurtleBot3 platform by optimizing existing OpenCR resources.
-The core objective was to overcome hardware constraints and signal conflicts through firmware-level engineering, avoiding the complexity and latency of additional MCUs or external power systems.
+This repository features a high-performance integration of a 1-axis Dynamixel gripper into the TurtleBot3 platform. By leveraging deep-level firmware optimization and direct memory access,
+this project achieves seamless control without the need for additional MCUs or external power distribution systems.
 
-1. Memory Optimization:
-  Zero-copy Strategy via Direct Pointer Casting To maintain a strict 100Hz real-time control loop, I implemented a Zero-copy strategy using Direct Pointer Casting.
-  By referencing memory addresses directly with (uint8_t*)& instead of copying data into temporary buffers, I eliminated redundant CPU cycles. This optimization reduced control loop latency to under 5ms, ensuring high-speed responsiveness despite limited computational resources.
+---
 
-4. Message Field Repurposing and Signal Filtering I repurposed the linear.y field of the standard ROS 2 Twist message for gripper control to maintain protocol efficiency.
-5. To resolve high-frequency jitter caused by default navigation signals, I developed a Non-zero Signal Filter within the firmware. This logic ensures only intentional control signals are processed, effectively protecting the OpenCR board and actuator from overheating and mechanical fatigue.
+### 1. Register-Level Control & Operating Mode 5
+To achieve a balance between grasping power and hardware safety, the actuator is configured at the register level:
+* **Operating Mode (Addr 11):** Set to **Mode 5 (Current-based Position Control)**. This allows the gripper to maintain a steady grasp while preventing mechanical stalling.
+* **Current Limit (Addr 38):** Capped at **300 units** to protect the Dynamixel from overcurrent while handling objects of varying densities.
+* **Address 142 Integration:** Utilized for real-time state monitoring and status feedback within the control loop to ensure synchronization between the OpenCR and the actuator.
 
-6. Control Logic:
-   Current-based Position Control The actuator operates in Operating Mode 5 (Current-based Position Control).
-   By implementing a programmable current limit (300 units), the gripper handles objects of varying densities without mechanical damage. This achieves a critical balance between grasping power and hardware precision while protecting the motor from overcurrent.
+### 2. Zero-Copy Strategy via Direct Pointer Casting
+To maintain a strict **100Hz real-time control loop**, I bypassed standard data buffering:
+* **Implementation:** Used `(uint8_t*)&` to reference memory addresses directly.
+* **Optimization:** By mapping the ROS 2 message data directly to the hardware registers, I eliminated redundant CPU cycles used for data copying.
+* **Result:** Reduced control loop latency to **under 5ms**, ensuring high-speed responsiveness under limited computational resources.
 
-8. Engineering Conclusion This project demonstrates that deep-level firmware optimization and protocol analysis are more effective than hardware expansion for solving complex integration problems. By removing redundancy, I established a robust, streamlined control architecture that maintains system integrity under strict operational constraints.
+### 3. Protocol Repurposing & Non-zero Signal Filtering
+Instead of creating a custom ROS 2 message (which increases overhead), I repurposed the `linear.y` field of the standard `geometry_msgs/Twist` message.
+* **Data Mapping:** Scaled `linear.y` values (e.g., `value * 100`) to pass integer commands through the existing navigation pipeline to **Address 154** (ADDR_CMD_VEL_LINEAR_Y).
+* **Signal Filter:** Developed a **Non-zero Signal Filter** in the firmware to ignore high-frequency jitter (floating-point noise) from the Navigation stack. This prevents motor fatigue and overheating by only processing intentional control commands.
 
-⚠️ [Caution]
-When utilizing existing TurtleBot3 hardware, the four fundamental kinematic variables defined within the turtlebot3 C++ source files—such as wheel_radius, wheel_separation, and related constants—must be maintained at their original default values. Altering these parameters can lead to critical errors in odometry calculations and overall navigation stability.
+---
 
-Author: Kim Minsang
 
-Department: Robot Engineering, Yeungnam University
+## ⚠️ [Caution] Hardware Integrity Constants
+When utilizing this firmware on standard TurtleBot3 hardware, the following kinematic variables defined in the `turtlebot3_ros2` C++ source files **must remain at their default values**:
+* `wheel_radius`: **0.033**
+* `wheel_separation`: **0.160**
+* *(And related kinematic constants)*
 
+**Why?** These parameters are hard-linked to the odometry calculation. Modifying them to accommodate the gripper will result in critical errors in SLAM accuracy and navigation stability. Gripper control is handled purely through the repurposed `linear.y` field to maintain system integrity.
+
+---
+
+##  Author
+Kim Minsang  Yeungnam University, Robot Engineering
 Focus: Embedded Systems, ROS 2, and Optimized Control Architectures.

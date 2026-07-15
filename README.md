@@ -9,7 +9,7 @@ Modified OpenCR firmware that integrates a 1-axis Dynamixel gripper (XC430, ID 1
 > **Companion change required:** the stock `turtlebot3_node` does not forward `linear.y` to the control table. One line in `cmd_vel_callback` enables it (see [How the Command Reaches the Motor](#how-the-command-reaches-the-motor)).
 
 https://github.com/user-attachments/assets/3f2868bf-0449-492b-99aa-3b6b4cb9c77d
----
+
 
 ## System Architecture
 

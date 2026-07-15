@@ -2,7 +2,7 @@
 
 **Adding a gripper axis to TurtleBot3 without a separate MCU, custom message types, or extra power distribution.**
 
-This repository is a modified OpenCR firmware library that integrates a 1-axis Dynamixel gripper (XC430, ID 11) into the stock TurtleBot3 ROS 2 stack. The unused `linear.y` field of the standard `geometry_msgs/Twist` is repurposed as the gripper command channel — the gripper is driven through the **existing `/cmd_vel` pipeline** with no new message types.
+Modified OpenCR firmware that integrates a 1-axis Dynamixel gripper (XC430, ID 11) into the stock TurtleBot3 ROS 2 stack, driven through the **existing `/cmd_vel` pipeline**.
 
 > Built for the **2025 Gyeongnam Global Innovation Festa** autonomous robot competition (Battle Rumble & Mission Robot) — **Grand Prize (Governor's Award)**.
 
@@ -13,45 +13,58 @@ This repository is a modified OpenCR firmware library that integrates a 1-axis D
 ## System Architecture
 
 ```
-┌────────────────────────────────────────────────────────────────┐
-│                      ROS 2 (Nav2 / Teleop)                     │
-│                                                                │
-│    geometry_msgs/Twist ──► /cmd_vel                            │
-│    ├─ linear.x   → drive  (used by diff-drive)                 │
-│    ├─ angular.z  → turn   (used by diff-drive)                 │
-│    └─ linear.y   → ◆ GRIPPER  (unused on diff-drive)           │
-│                     open: -1.0 · close: -0.3                   │
-└───────────────────────────────┬────────────────────────────────┘
-                                │
-              modified turtlebot3_node (cmd_vel_callback)
-              dword[1] = linear.y × 100   ← one-line change
-                                │  USB / DYNAMIXEL Protocol 2.0
-┌───────────────────────────────▼────────────────────────────────┐
-│                     OpenCR (this firmware)                     │
-│                                                                │
-│   Control Table                                                │
-│   ├─ Addr 152 : linear.x  ──► wheel motors (ID 1, 2)           │
-│   ├─ Addr 154 : linear.y  ──► ◆ non-zero filter                │
-│   │                            └► ×0.01 → rad → tick           │
-│   │                               → gripper (XC430, ID 11)     │
-│   └─ 50 Hz motor control loop (20 ms interval)                 │
-└────────────────────────────────────────────────────────────────┘
+ROS 2 (Nav2 / Teleop)
+  geometry_msgs/Twist → /cmd_vel
+   ├─ linear.x  → drive
+   ├─ angular.z → turn
+   └─ linear.y  → ◆ GRIPPER
+        (unused on diff-drive)
+        open -1.0 · close -0.3
+              │
+              ▼
+modified turtlebot3_node
+  cmd_vel_callback:
+  dword[1] = linear.y × 100
+  ← one-line change
+              │
+              ▼  USB / Protocol 2.0
+OpenCR (this firmware)
+  Addr 152: linear.x
+    → wheel motors (ID 1, 2)
+  Addr 154: linear.y
+    → ◆ non-zero filter
+    → ×0.01 → rad → tick
+    → gripper (XC430, ID 11)
+  50 Hz control loop (20 ms)
 ```
 
 ---
 
 ## Key Engineering Decisions
 
-### 1. Protocol Repurposing — `linear.y` as the Gripper Channel
+### 1. The Integration Problem — Three Ways to Add an Actuator
 
-On a differential-drive robot, `linear.y` (lateral velocity) is physically meaningless and always empty. This firmware registers it as a control-table item (**Addr 154**) and maps it to the gripper.
+TurtleBot3's control path is closed around its two wheel motors: OpenCR firmware and `turtlebot3_node` exchange a fixed control table, and nothing in the stock stack expects a third actuator. The usual options for adding one:
 
-- **Why not a custom ROS 2 message?** A custom interface means new message definitions, build dependencies, and a separate communication path. Reusing an existing-but-unused field keeps Nav2/teleop untouched — the gripper is commanded with a plain `Twist` publish.
-- **Trade-off (known and accepted):** field repurposing sacrifices interface self-documentation. In production, a dedicated message/service would be the right call; under competition constraints, minimal-change integration won.
+| Option | Cost |
+|---|---|
+| Separate MCU (e.g., Arduino) for the gripper | extra board, extra power distribution, second comms path |
+| Custom ROS 2 message/service | new interface definitions, build dependencies, changes in every consuming node |
+| **Repurpose an unused field in the existing pipeline** | one control-table entry + one line in the ROS 2 node |
 
-### 2. Non-zero Signal Filter — One Choke Point for Every Publisher
+On a differential-drive robot, `linear.y` (lateral velocity) is physically meaningless — the field travels through the whole Nav2/teleop pipeline permanently empty. Registering it as a control-table item (**Addr 154**) and mapping it to the gripper gives a command channel with **zero new hardware and zero new interfaces**: the gripper is commanded with a plain `Twist` publish.
 
-Nav2 and teleop continuously publish `Twist` messages with `linear.y = 0` as their default. The firmware processes the gripper channel **only when the value is non-zero**:
+**Trade-off, accepted knowingly:** field repurposing sacrifices interface self-documentation — `linear.y = -0.3` doesn't announce that it closes a gripper. In production, a dedicated message/service is the right call; under competition constraints, minimal-change integration won.
+
+### 2. Non-zero Signal Filter — One Choke Point Instead of Many Patches
+
+A consequence of sharing `/cmd_vel`: the gripper channel now has **multiple publishers with conflicting defaults**. Nav2 and teleop continuously publish `Twist` messages with `linear.y = 0`, so an intentional gripper command from another terminal competes with a stream of zeros on the same topic.
+
+Two possible fixes:
+- Patch every publisher (teleop, Nav2, every future node) to stop emitting the default — invasive, and breaks again with each new node
+- Filter once, in firmware, at the single point every command must pass through
+
+This firmware takes the second path:
 
 ```cpp
 if (control_items.cmd_vel_linear[1] != 0)   // process only intentional commands
@@ -64,8 +77,7 @@ if (control_items.cmd_vel_linear[1] != 0)   // process only intentional commands
 // value == 0 → block skipped → gripper HOLDS its last position
 ```
 
-- Since 0 is never a gripper command (open `-1.0`, close `-0.3`), zero doubles as the *hold* signal: the previous goal is kept and the gripper keeps gripping. **Filtering is the hold logic.**
-- Placed in firmware rather than ROS: patching on the ROS side would mean modifying every publisher (teleop, Nav2, any future node); one `if` statement at the firmware choke-point covers them all.
+The design closes neatly because 0 is never a valid gripper command (open `-1.0`, close `-0.3`): zero doubles as the *hold* signal — the previous goal is kept and the gripper keeps gripping. **Filtering is the hold logic.**
 
 ### How the Command Reaches the Motor
 
@@ -76,17 +88,17 @@ if (control_items.cmd_vel_linear[1] != 0)   // process only intentional commands
 | Firmware | `rad × 651.89 + 2048` → ticks (4096 ticks / 2π, centered) | same block |
 | Firmware | clamp 100–4000 ticks | mechanical soft limits |
 
-### 3. Gripper Drive — Position Control
+### 3. Gripper Drive — Position Control Within the Motor's Limits
 
-The gripper Dynamixel (ID 11) runs in **Position Control Mode (3)** and is initialized at boot:
+The XC430 has no current sensor and no current-control loop (its valid modes: velocity / position / extended position / PWM). That constraint sets the division of labor: **force-aware grasping cannot live in this motor's control loop**, so this firmware keeps the gripper's job simple and safe — position commands bounded by soft limits — and leaves force logic to a layer that can actually observe force. (That layer was built in the follow-up standalone gripper project, using Present Load feedback.)
+
+Boot initialization (ID 11):
 
 | Register | Value | Purpose |
 |---|---|---|
 | Addr 11 (Operating Mode) | **3** — Position Control | set with torque off (EEPROM area) |
 | Addr 64 (Torque Enable) | 1 | enable output |
 | Addr 116 (Goal Position) | 2048 | centered initial pose |
-
-Open/close commands from `linear.y` map directly to goal positions; the firmware-side soft limits (100–4000 ticks) bound the mechanical range.
 
 ### 4. Hardware Integrity Constants — Do Not Touch
 
@@ -95,7 +107,7 @@ Kinematic constants must remain stock on standard TurtleBot3 hardware:
 - `wheel_radius = 0.033`
 - `wheel_separation = 0.160`
 
-These feed odometry directly; changing them corrupts SLAM/Nav2 accuracy. That is exactly why gripper control lives in the repurposed `linear.y` field — **the drive kinematics stay untouched.**
+These feed odometry directly; changing them corrupts SLAM/Nav2 accuracy. This is the other half of the `linear.y` decision: the gripper rides in an unused field precisely so that **the drive kinematics stay untouched.**
 
 ---
 
